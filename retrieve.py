@@ -70,7 +70,7 @@ def search_batch(
     # Fix 4: Upgrade to FAISS for BLAS/C++ optimized similarity search
     # We retrieve *all* chunks (index.ntotal) to ensure MaxP aggregation
     # doesn't miss chunks from pages that might be pushed down the list.
-    scores, indices = index.search(query_vectors, k=index.ntotal)
+    scores, indices = index.search(query_vectors, k=min(1000, index.ntotal))
 
     ranked: List[List[int]] = []
 
