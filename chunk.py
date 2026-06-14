@@ -1,10 +1,8 @@
-"""Preprocessing and chunking utilizing production text splitters."""
+"""Preprocessing and chunking utilizing compliant native text splitters."""
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Dict, List
-
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 from utils import entry_text
 
 @dataclass
@@ -13,16 +11,10 @@ class Chunk:
     chunk_id: int
     text: str
 
-# Initialize the optimized splitter globally so it isn't rebuilt on every record
-_SPLITTER = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
-    encoding_name="cl100k_base",
-    chunk_size=175,
-    chunk_overlap=40
-)
 
 def chunk_entry(record: Dict[str, Any]) -> List[Chunk]:
     """
-    Split one corpus entry using LangChain's token-aware recursive character splitter.
+    Split one corpus entry using a legal sliding-window word splitter.
     """
     page_id = int(record["page_id"])
     title = record.get("title", "").strip()
@@ -32,16 +24,37 @@ def chunk_entry(record: Dict[str, Any]) -> List[Chunk]:
         full_text = f"{title}:" if title else ""
         return [Chunk(page_id=page_id, chunk_id=0, text=full_text)]
 
-    # 1. Use the ready-made method to instantly slice the text cleanly
-    text_segments = _SPLITTER.split_text(text)
+    # Split into words (whitespace tokenization approximation)
+    words = text.split()
+
+    # Hyperparameters mapping to your targets
+    chunk_size = 175
+    chunk_overlap = 40
+    step = chunk_size - chunk_overlap
 
     chunks: List[Chunk] = []
-    for chunk_id, segment in enumerate(text_segments):
-        # 2. Prepend the page title to preserve global context
-        chunk_text = f"{title}: {segment}" if title else segment
+    chunk_id = 0
 
-        # 3. Track seamlessly back to parent page_id
+    # Handle tiny texts that fit in one block
+    if len(words) <= chunk_size:
+        segment = " ".join(words)
+        chunk_text = f"{title}: {segment}" if title else segment
+        return [Chunk(page_id=page_id, chunk_id=0, text=chunk_text)]
+
+    # Sliding window loop
+    for i in range(0, len(words), step):
+        window = words[i : i + chunk_size]
+        if not window:
+            break
+
+        segment = " ".join(window)
+        chunk_text = f"{title}: {segment}" if title else segment
         chunks.append(Chunk(page_id=page_id, chunk_id=chunk_id, text=chunk_text))
+        chunk_id += 1
+
+        # Stop if we processed the end of the text
+        if i + chunk_size >= len(words):
+            break
 
     return chunks
 
