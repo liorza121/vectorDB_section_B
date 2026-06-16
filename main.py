@@ -12,7 +12,7 @@ from index import build_index
 from retrieve import search_batch
 
 
-def run(queries: List[str]) -> List[List[int]]:
+def run(queries: List[str], pool=3000) -> List[List[int]]:
     """
     Rank corpus pages for each query.
 
@@ -27,7 +27,7 @@ def run(queries: List[str]) -> List[List[int]]:
         One ranked list of page_id per query (most relevant first).
         Only the first 10 IDs per list are scored.
     """
-    return search_batch(queries)
+    return search_batch(queries, rerank_pool_size=pool)
 
 
 def build_offline_index() -> None:
