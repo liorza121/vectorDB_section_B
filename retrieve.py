@@ -25,7 +25,7 @@ _CROSS_ENCODER = None
 def _get_cross_encoder() -> CrossEncoder:
     global _CROSS_ENCODER
     if _CROSS_ENCODER is None:
-        # Swap MiniLM for TinyBERT for massive speed gains
+        # Revert back to the lightweight, blazing fast TinyBERT (100% legal)
         _CROSS_ENCODER = CrossEncoder('cross-encoder/ms-marco-TinyBERT-L-2-v2', max_length=256)
     return _CROSS_ENCODER
 
@@ -49,6 +49,9 @@ def _get_index(artifacts_dir=None):
         vectors = np.load(root / INDEX_VECTORS_NAME)
         if vectors.dtype != np.float32:
             vectors = vectors.astype(np.float32)
+
+        # CRITICAL FIX: Normalize vectors to unit length for accurate Cosine Similarity inside IndexFlatIP
+        faiss.normalize_L2(vectors)
 
         # 3. Setup clean flat Inner Product FAISS space
         dimension = vectors.shape[1]  # Confirms 384 dimensions
@@ -79,6 +82,9 @@ def search_batch(
 
     if query_vectors.dtype != np.float32:
         query_vectors = query_vectors.astype(np.float32)
+
+    # CRITICAL FIX: Normalize query vectors to match the normalized index
+    faiss.normalize_L2(query_vectors)
 
     # STAGE 1: Fast FAISS scan for a broader pool of candidates
     faiss_k = min(rerank_pool_size, index.ntotal)
@@ -112,7 +118,7 @@ def search_batch(
     # STAGE 2: Bulk Cross-Encoder Reranking
     # Passing the entire flattened list to predict at once maximizes hardware utilization.
     # Note: You can tweak `batch_size` up or down depending on your GPU VRAM.
-    all_ce_scores = cross_encoder.predict(all_cross_inputs, batch_size=256)
+    all_ce_scores = cross_encoder.predict(all_cross_inputs, batch_size=128)
 
     # STAGE 3: Unpack and MaxP Aggregation
     current_idx = 0

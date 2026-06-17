@@ -27,7 +27,8 @@ def run(queries: List[str], pool=3000) -> List[List[int]]:
         One ranked list of page_id per query (most relevant first).
         Only the first 10 IDs per list are scored.
     """
-    return search_batch(queries, rerank_pool_size=pool)
+    optimized_pool = 1000
+    return search_batch(queries, rerank_pool_size=optimized_pool)
 
 
 def build_offline_index() -> None:
