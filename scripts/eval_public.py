@@ -32,10 +32,9 @@ def main() -> None:
     # 2. Wrap the run function so evaluate_run can call it normally,
     # but the pool parameter is securely passed in.
     # Note: Adjust the keyword argument 'pool=' if your main.run uses a different parameter name (e.g., 'rerank_pool_size=')
-    run_with_pool = lambda q: run(q, pool=args.pool)
 
     t0 = time.perf_counter()
-    stats = evaluate_run(queries, ground_truth, run_with_pool)
+    stats = evaluate_run(queries, ground_truth, run)
     elapsed = time.perf_counter() - t0
 
     print(f"public_queries={len(queries)}")

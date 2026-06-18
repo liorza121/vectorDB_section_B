@@ -1,9 +1,11 @@
-"""Offline index build and load with Cross-Encoder text caching."""
+"""Offline index build and load with Pre-Computed Time Indexing."""
 from __future__ import annotations
 
 import json
+import re
+from collections import defaultdict
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Set, Tuple
 
 import numpy as np
 
@@ -17,14 +19,29 @@ INDEX_META_NAME = "index_meta.json"
 BATCH_SIZE = 10000  # Number of chunks to hold in memory before embedding
 
 
+def extract_time_terms(text: str) -> Set[str]:
+    """Extracts 4-digit years and decades from text for the inverted index."""
+    terms = set()
+
+    # Find exact years (e.g., 1987, 1826) - matches 1700 to 2099
+    years = re.findall(r'\b(?:17|18|19|20)\d{2}\b', text)
+    terms.update(years)
+
+    # Find decades (e.g., 1820s) - matches 1700s to 2090s
+    decades = re.findall(r'\b(?:17|18|19|20)\d0s\b', text)
+    terms.update(decades)
+
+    return terms
+
+
 def build_index(
         *,
         entries_dir: Optional[Path] = None,
         artifacts_dir: Optional[Path] = None,
 ) -> Tuple[np.ndarray, List[int]]:
     """
-    Builds a standard 384-dimensional single-vector dense index using a
-    memory-safe batched streaming pipeline.
+    Builds a dense index while simultaneously pre-computing an inverted
+    dictionary for O(1) time-constraint lookups.
     """
     out_dir = artifacts_dir or ensure_artifacts_dir()
 
@@ -34,14 +51,18 @@ def build_index(
     all_chunk_texts: List[str] = []
     all_vector_batches: List[np.ndarray] = []
 
+    # Inverted index for O(1) metadata filtering
+    time_index = defaultdict(list)
+    global_chunk_count = 0
+
     # Temporary buckets for the current batch
     current_batch_texts: List[str] = []
     current_batch_page_ids: List[int] = []
     current_batch_chunk_ids: List[int] = []
 
-    print("Starting batched index build...", flush=True)
+    print("Starting batched index build with inverted time indexing...", flush=True)
 
-    # 1. Stream entries one by one (No list() wrapper!)
+    # 1. Stream entries one by one
     for record in iter_entries(entries_dir):
         chunks: List[Chunk] = chunk_entry(record)
 
@@ -50,7 +71,14 @@ def build_index(
             current_batch_page_ids.append(c.page_id)
             current_batch_chunk_ids.append(c.chunk_id)
 
-        # 2. When the bucket is full, embed it and flush the RAM
+            # 2. Extract terms and map them to this specific chunk's global ID
+            terms = extract_time_terms(c.text)
+            for term in terms:
+                time_index[term].append(global_chunk_count)
+
+            global_chunk_count += 1
+
+        # 3. When the bucket is full, embed it and flush the RAM
         if len(current_batch_texts) >= BATCH_SIZE:
             print(f"Embedding batch of {len(current_batch_texts)} chunks...", flush=True)
             vectors = embed_texts(current_batch_texts)
@@ -63,12 +91,11 @@ def build_index(
             all_chunk_ids.extend(current_batch_chunk_ids)
             all_chunk_texts.extend(current_batch_texts)
 
-            # Clear the temporary buckets to free memory
             current_batch_texts = []
             current_batch_page_ids = []
             current_batch_chunk_ids = []
 
-    # 3. Catch any leftover chunks in the final partial batch
+    # 4. Catch any leftover chunks in the final partial batch
     if current_batch_texts:
         print(f"Embedding final batch of {len(current_batch_texts)} chunks...", flush=True)
         vectors = embed_texts(current_batch_texts)
@@ -81,23 +108,23 @@ def build_index(
         all_chunk_ids.extend(current_batch_chunk_ids)
         all_chunk_texts.extend(current_batch_texts)
 
-    # 4. Consolidate all the individual vector batches into one massive matrix
+    # 5. Consolidate all the individual vector batches
     print("Concatenating vector batches...", flush=True)
     if all_vector_batches:
         final_vectors = np.vstack(all_vector_batches)
     else:
         final_vectors = np.empty((0, 384), dtype=np.float32)
 
-    # Save the raw numpy matrix artifact
     print("Saving vectors to disk...", flush=True)
     np.save(out_dir / INDEX_VECTORS_NAME, final_vectors)
 
-    # 5. Store mappings AND the raw text payload needed for Stage-2 re-ranking
-    print("Saving metadata to disk...", flush=True)
+    # 6. Store mappings AND the newly computed inverted index
+    print("Saving metadata and inverted index to disk...", flush=True)
     meta = {
         "page_ids": all_page_ids,
         "chunk_ids": all_chunk_ids,
         "chunk_texts": all_chunk_texts,
+        "time_index": dict(time_index),  # Convert to standard dict for JSON compatibility
         "model": "sentence-transformers/all-MiniLM-L6-v2",
         "num_vectors": len(all_page_ids),
     }
@@ -106,7 +133,7 @@ def build_index(
         json.dumps(meta, indent=2), encoding="utf-8"
     )
 
-    print("Index compilation complete! Meta and vectors saved securely.", flush=True)
+    print("Index compilation complete! Meta, vectors, and time index saved securely.", flush=True)
     return final_vectors, all_page_ids
 
 

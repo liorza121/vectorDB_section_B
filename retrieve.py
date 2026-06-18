@@ -1,71 +1,217 @@
-"""Optimized Retrieval pipeline with Broad Recall and Top-K Summation."""
+"""Optimized Retrieval pipeline with Pre-Computed Time Index Filtering.
+Refactored for modularity, clean helper functions, and zero magic numbers.
+"""
 from __future__ import annotations
 
 import heapq
+import json
+import re
 from collections import defaultdict
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Set, Tuple
+
 import faiss
 import numpy as np
-import json
-
 from sentence_transformers import CrossEncoder
+
 from embed import embed_queries
 
-# Global variables for lazy loading cache
-_FAISS_INDEX: Optional[faiss.IndexFlatIP] = None
-_PAGE_IDS: Optional[List[int]] = None
-_META_DICT: Optional[dict] = None
-
+# =============================================================================
+# Configuration Constants (No Magic Numbers)
+# =============================================================================
 INDEX_VECTORS_NAME = "index_vectors.npy"
 INDEX_META_NAME = "index_meta.json"
+
 K_EVAL = 10
-_CROSS_ENCODER = None
+DEFAULT_RERANK_POOL_SIZE = 1500
+MAX_FAISS_RETRIEVAL = 2000
+MAX_CHUNKS_PER_PAGE = 3
+
+CE_MODEL_NAME = 'cross-encoder/ms-marco-TinyBERT-L-2-v2'
+CE_MAX_LENGTH = 256
+CE_BATCH_SIZE = 128
+
+# =============================================================================
+# Global State Cache
+# =============================================================================
+_FAISS_INDEX: Optional[faiss.IndexIDMap] = None
+_META_DICT: Optional[dict] = None
+_CHUNK_TO_PAGE: Optional[dict] = None
+_CHUNK_TO_TEXT: Optional[dict] = None
+_CROSS_ENCODER: Optional[CrossEncoder] = None
 
 
+# =============================================================================
+# Initialization Helpers
+# =============================================================================
 def _get_cross_encoder() -> CrossEncoder:
+    """Lazy load the Cross-Encoder model."""
     global _CROSS_ENCODER
     if _CROSS_ENCODER is None:
-        _CROSS_ENCODER = CrossEncoder('cross-encoder/ms-marco-TinyBERT-L-2-v2', max_length=256)
+        _CROSS_ENCODER = CrossEncoder(CE_MODEL_NAME, max_length=CE_MAX_LENGTH)
     return _CROSS_ENCODER
 
 
-def _get_index(artifacts_dir=None):
-    global _FAISS_INDEX, _PAGE_IDS, _META_DICT
+def _get_index(artifacts_dir: Optional[Path] = None) -> Tuple[faiss.IndexIDMap, dict, dict, dict]:
+    """Lazy load the FAISS index and metadata mappings."""
+    global _FAISS_INDEX, _META_DICT, _CHUNK_TO_PAGE, _CHUNK_TO_TEXT
+
     if _FAISS_INDEX is None:
         root = Path("artifacts") if artifacts_dir is None else Path(artifacts_dir)
         meta_path = root / INDEX_META_NAME
         _META_DICT = json.loads(meta_path.read_text(encoding="utf-8"))
-        _PAGE_IDS = [int(x) for x in _META_DICT["page_ids"]]
+
+        num_chunks = len(_META_DICT["chunk_texts"])
+        global_ids = list(range(num_chunks))
+
+        _CHUNK_TO_PAGE = {gid: pid for gid, pid in enumerate(_META_DICT["page_ids"])}
+        _CHUNK_TO_TEXT = {gid: text for gid, text in enumerate(_META_DICT["chunk_texts"])}
 
         vectors = np.load(root / INDEX_VECTORS_NAME)
         if vectors.dtype != np.float32:
             vectors = vectors.astype(np.float32)
 
         faiss.normalize_L2(vectors)
-
         dimension = vectors.shape[1]
-        index = faiss.IndexFlatIP(dimension)
-        index.add(vectors)
+
+        base_index = faiss.IndexFlatIP(dimension)
+        index = faiss.IndexIDMap(base_index)
+
+        chunk_ids_array = np.array(global_ids, dtype=np.int64)
+        index.add_with_ids(vectors, chunk_ids_array)
+
         _FAISS_INDEX = index
 
-    return _FAISS_INDEX, _PAGE_IDS, _META_DICT
+    return _FAISS_INDEX, _META_DICT, _CHUNK_TO_PAGE, _CHUNK_TO_TEXT
 
 
+# =============================================================================
+# Query Processing & Filtering Helpers
+# =============================================================================
+def extract_time_constraints(query: str) -> List[Set[str]]:
+    """Extracts exact years and expands decades into valid year sets."""
+    constraints = []
+
+    # 1. Match exact 4-digit years NOT followed by an 's' (e.g., "1987")
+    year_matches = re.finditer(r'\b((?:17|18|19|20)\d{2})\b(?!\s*s)', query)
+    for match in year_matches:
+        constraints.append({match.group(1)})
+
+    # 2. Match decades (e.g., "1820s")
+    decade_matches = re.finditer(r'\b((?:17|18|19|20)\d)0s\b', query)
+    for match in decade_matches:
+        base_year = int(match.group(1) + "0")
+        valid_terms = {f"{base_year}s"} | {str(y) for y in range(base_year, base_year + 10)}
+        constraints.append(valid_terms)
+
+    return constraints
+
+
+def _build_search_parameters(
+    query: str, time_index: dict
+) -> Tuple[Optional[faiss.SearchParameters], Optional[np.ndarray], Optional[faiss.IDSelectorArray]]:
+    """
+    Builds a FAISS IDSelectorArray based on extracted time constraints.
+    CRITICAL: Returns the numpy array and selector object to prevent Python's GC
+    from destroying them before FAISS executes the search in C++.
+    """
+    constraints = extract_time_constraints(query)
+    if not constraints:
+        return None, None, None
+
+    valid_ids_set = None
+
+    for constraint_group in constraints:
+        group_ids = set()
+        for term in constraint_group:
+            if term in time_index:
+                group_ids.update(time_index[term])
+
+        if valid_ids_set is None:
+            valid_ids_set = group_ids
+        else:
+            valid_ids_set.intersection_update(group_ids)
+
+    if valid_ids_set:
+        valid_ids_array = np.array(list(valid_ids_set), dtype=np.int64)
+    else:
+        valid_ids_array = np.array([], dtype=np.int64)
+
+    sel = faiss.IDSelectorArray(valid_ids_array.size, faiss.swig_ptr(valid_ids_array))
+    params = faiss.SearchParameters(sel=sel)
+
+    return params, valid_ids_array, sel
+
+
+# =============================================================================
+# Aggregation & Scoring Helpers
+# =============================================================================
+def _filter_top_pages_from_faiss(
+    row_chunk_ids: np.ndarray,
+    row_dists: np.ndarray,
+    chunk_to_page: dict,
+    pool_size: int
+) -> Tuple[List[int], Dict[int, List[int]]]:
+    """Groups FAISS chunk results by Page ID and isolates the top candidate pages."""
+    page_to_chunks = defaultdict(list)
+    page_max_faiss = defaultdict(float)
+
+    for cid, dist in zip(row_chunk_ids, row_dists):
+        if cid == -1:
+            continue
+        pid = chunk_to_page[cid]
+        page_to_chunks[pid].append(cid)
+
+        if dist > page_max_faiss[pid]:
+            page_max_faiss[pid] = float(dist)
+
+    top_candidate_pages = heapq.nlargest(
+        pool_size,
+        page_max_faiss.keys(),
+        key=lambda p: page_max_faiss[p]
+    )
+
+    return top_candidate_pages, dict(page_to_chunks)
+
+
+def _aggregate_cross_encoder_scores(
+    ce_scores: np.ndarray,
+    candidate_page_ids: List[int],
+    top_k: int
+) -> List[int]:
+    """Sums top chunk scores per page to determine final page relevance."""
+    page_ce_scores = defaultdict(list)
+    for score, pid in zip(ce_scores, candidate_page_ids):
+        page_ce_scores[pid].append(float(score))
+
+    page_final_scores = {}
+    for pid, scores in page_ce_scores.items():
+        scores.sort(reverse=True)
+        page_final_scores[pid] = sum(scores[:MAX_CHUNKS_PER_PAGE])
+
+    top_pages = heapq.nlargest(
+        top_k,
+        page_final_scores.keys(),
+        key=lambda p: page_final_scores[p]
+    )
+    return top_pages
+
+
+# =============================================================================
+# Main Pipeline
+# =============================================================================
 def search_batch(
         queries: List[str],
         *,
         top_k: int = K_EVAL,
-        rerank_pool_size: int = 60,  # Number of unique PAGES to rerank, not chunks
         artifacts_dir: Optional[Path] = None,
-        **kwargs  # Absorb any loose kwargs from main.py like 'pool='
+        **kwargs
 ) -> List[List[int]]:
+    """Executes the two-stage logic/semantic retrieval pipeline."""
 
-    # Check if main.py is passing 'pool' instead of 'rerank_pool_size'
-    if 'pool' in kwargs:
-        rerank_pool_size = kwargs['pool']
+    rerank_pool_size = kwargs.get('pool', DEFAULT_RERANK_POOL_SIZE)
 
-    index, page_ids, meta = _get_index(artifacts_dir)
+    index, meta, chunk_to_page, chunk_to_text = _get_index(artifacts_dir)
     cross_encoder = _get_cross_encoder()
 
     query_vectors = embed_queries(queries)
@@ -75,60 +221,65 @@ def search_batch(
         query_vectors = query_vectors.astype(np.float32)
 
     faiss.normalize_L2(query_vectors)
+    faiss_k = min(MAX_FAISS_RETRIEVAL, index.ntotal)
+    time_index = meta.get("time_index", {})
 
-    # WIDEN THE NET: Retrieve a massive number of chunks from FAISS (2000)
-    # This solves the "Recall Bottleneck" where synthetic templates push
-    # the ground truth document completely out of the candidate pool.
-    faiss_k = min(2000, index.ntotal)
-    faiss_dists, faiss_indices = index.search(query_vectors, k=faiss_k)
-
-    ranked: List[List[int]] = []
     all_cross_inputs = []
     query_boundaries = []
 
-    for i, (query, row_indices, row_dists) in enumerate(zip(queries, faiss_indices, faiss_dists)):
-        page_to_chunks = defaultdict(list)
-        page_max_faiss = defaultdict(float)
+    # ---------------------------------------------------------
+    # Stage 1: Pre-filtered FAISS Retrieval
+    # ---------------------------------------------------------
+    for i, query in enumerate(queries):
 
-        # Group the 2000 retrieved chunks by their parent Page ID
-        for idx, dist in zip(row_indices, row_dists):
-            if idx == -1:
-                continue
-            pid = page_ids[idx]
-            page_to_chunks[pid].append(idx)
+        # The variables _keepalive_array and _keepalive_sel are explicitly scoped
+        # here so they are not destroyed before index.search() executes.
+        params, _keepalive_array, _keepalive_sel = _build_search_parameters(query, time_index)
+        query_vector = query_vectors[i].reshape(1, -1)
 
-            # Keep the maximum FAISS score for each page
-            if dist > page_max_faiss[pid]:
-                page_max_faiss[pid] = float(dist)
+        if params:
+            faiss_dists, faiss_indices = index.search(
+                query_vector,
+                k=faiss_k,
+                params=params
+            )
+        else:
+            faiss_dists, faiss_indices = index.search(
+                query_vector,
+                k=faiss_k
+            )
 
-        # Select the Top `rerank_pool_size` PAGES based on their best FAISS chunk
-        top_candidate_pages = heapq.nlargest(
-            rerank_pool_size,
-            page_max_faiss.keys(),
-            key=lambda p: page_max_faiss[p]
+        top_candidate_pages, page_to_chunks = _filter_top_pages_from_faiss(
+            faiss_indices[0],
+            faiss_dists[0],
+            chunk_to_page,
+            rerank_pool_size
         )
 
         query_chunks_count = 0
         query_pids = []
 
-        # For each candidate page, extract up to 3 chunks to send to the Cross-Encoder
         for pid in top_candidate_pages:
-            # The lists in page_to_chunks are implicitly sorted by FAISS rank
-            selected_chunk_idxs = page_to_chunks[pid][:3]
+            selected_chunk_ids = page_to_chunks[pid][:MAX_CHUNKS_PER_PAGE]
 
-            for idx in selected_chunk_idxs:
-                text = meta["chunk_texts"][idx]
-                all_cross_inputs.append([query, text])
+            for cid in selected_chunk_ids:
+                all_cross_inputs.append([query, chunk_to_text[cid]])
                 query_pids.append(pid)
                 query_chunks_count += 1
 
         query_boundaries.append((query_chunks_count, query_pids))
 
-    # Bulk Cross-Encoder Reranking
-    all_ce_scores = cross_encoder.predict(all_cross_inputs, batch_size=128)
+    if not all_cross_inputs:
+        return [[] for _ in queries]
 
-    # Unpack and Aggregate with Top-K Summation
+    # ---------------------------------------------------------
+    # Stage 2: Cross-Encoder Reranking
+    # ---------------------------------------------------------
+    all_ce_scores = cross_encoder.predict(all_cross_inputs, batch_size=CE_BATCH_SIZE)
+
+    ranked: List[List[int]] = []
     current_idx = 0
+
     for num_candidates, candidate_page_ids in query_boundaries:
         if num_candidates == 0:
             ranked.append([])
@@ -137,23 +288,7 @@ def search_batch(
         ce_scores = all_ce_scores[current_idx : current_idx + num_candidates]
         current_idx += num_candidates
 
-        # Group Cross-Encoder scores by page ID
-        page_ce_scores = defaultdict(list)
-        for score, pid in zip(ce_scores, candidate_page_ids):
-            page_ce_scores[pid].append(float(score))
-
-        page_final_scores = {}
-        for pid, scores in page_ce_scores.items():
-            # Sum the top 3 Cross-Encoder chunk scores for the page
-            scores.sort(reverse=True)
-            page_final_scores[pid] = sum(scores[:3])
-
-        # Select final Top 10 pages for the query
-        top_pages = heapq.nlargest(
-            top_k,
-            page_final_scores.keys(),
-            key=lambda p: page_final_scores[p]
-        )
+        top_pages = _aggregate_cross_encoder_scores(ce_scores, candidate_page_ids, top_k)
         ranked.append(top_pages)
 
     return ranked
