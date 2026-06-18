@@ -4,6 +4,12 @@ An end-to-end search and retrieval architecture optimized for high speed and max
 
 ---
 
+### Video Demonstration Link:
+https://drive.google.com/file/d/1X2rAjN77Bqm5Hb2O6DCLeH1YBoVZmmpg/view?usp=sharing
+### Slides link:
+https://docs.google.com/presentation/d/1vPEx3chFruAgN0z9cRehPiIbcfyITrcS-F2oS5VPTgk/edit?usp=drive_link
+
+
 ## 🛠️ System Architecture
 
 Our pipeline processes raw text documents and executes targeted factual query retrieval through a four-stage process:
@@ -69,4 +75,6 @@ After building, verify that a fresh run successfully loads your submitted artifa
 ```bash
 python scripts/eval_public.py
 ```
+
+
 
