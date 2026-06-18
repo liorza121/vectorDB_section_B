@@ -5,9 +5,9 @@ An end-to-end search and retrieval architecture optimized for high speed and max
 ---
 
 ### Video Demonstration Link:
-https://drive.google.com/file/d/1X2rAjN77Bqm5Hb2O6DCLeH1YBoVZmmpg/view?usp=sharing
+[https://drive.google.com/file/d/1X2rAjN77Bqm5Hb2O6DCLeH1YBoVZmmpg/view?usp=sharing](https://drive.google.com/file/d/1X2rAjN77Bqm5Hb2O6DCLeH1YBoVZmmpg/view?usp=sharing)
 ### Slides link:
-https://docs.google.com/presentation/d/1vPEx3chFruAgN0z9cRehPiIbcfyITrcS-F2oS5VPTgk/edit?usp=drive_link
+[https://docs.google.com/presentation/d/1vPEx3chFruAgN0z9cRehPiIbcfyITrcS-F2oS5VPTgk/edit?usp=drive_link](https://docs.google.com/presentation/d/1vPEx3chFruAgN0z9cRehPiIbcfyITrcS-F2oS5VPTgk/edit?usp=sharing)
 
 
 ## 🛠️ System Architecture
